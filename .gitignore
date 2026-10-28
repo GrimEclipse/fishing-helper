@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+fishbobber.ogg
+legacy_config.json
+config.json
+noise.npy
+.venv/
+.idea/

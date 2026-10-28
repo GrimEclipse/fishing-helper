@@ -1,0 +1,5 @@
+## Interface: 120007
+## Title: FishingHelper Bridge
+## Notes: Records fishing casts, loot and combat only after /fh start.
+## SavedVariables: FishingHelperBridgeDB
+FishingHelperBridge.lua
