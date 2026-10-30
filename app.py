@@ -21,10 +21,11 @@ import win32gui
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QScrollArea, QSpinBox, QTextEdit, QVBoxLayout, QWidget)
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSpinBox, QTextEdit, QVBoxLayout, QWidget)
 from pynput.keyboard import Controller, KeyCode
 
-from bridge import read_events, summarize
+from bridge import merge_events, read_events, summarize
+from live_bridge import read_visible_packet
 
 
 ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
@@ -161,8 +162,9 @@ def combat_beacon():
     """Top-left red/green addon marker is available only while game is visible."""
     if not game_foreground(): return None
     try:
+        left, top = win32gui.ClientToScreen(wow_window(), (0, 0))
         dc = ctypes.windll.user32.GetDC(0)
-        try: pixel = ctypes.windll.gdi32.GetPixel(dc, 5, 5)
+        try: pixel = ctypes.windll.gdi32.GetPixel(dc, left + 5, top + 5)
         finally: ctypes.windll.user32.ReleaseDC(0, dc)
         red, green, blue = pixel & 255, (pixel >> 8) & 255, (pixel >> 16) & 255
         if red > 180 and green < 100 and blue < 100: return True
@@ -170,6 +172,47 @@ def combat_beacon():
     except Exception:
         pass
     return None
+
+
+def volume_level(rms):
+    """Show input level on a familiar 0–100 scale (−60 to 0 dBFS)."""
+    return max(0, min(100, round((20 * np.log10(max(rms, 1e-5)) + 60) * 100 / 60)))
+
+
+class IdleMeter(QObject):
+    level = pyqtSignal(float)
+
+    def __init__(self):
+        super().__init__()
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive(): self.thread.join(timeout=1)
+
+    def start(self, device_id):
+        self.stop()
+        if device_id is None: return
+        self.stop_event = threading.Event()
+        stop_event = self.stop_event
+        self.thread = threading.Thread(target=self._run, args=(device_id, stop_event), daemon=True)
+        self.thread.start()
+
+    def _run(self, device_id, stop_event):
+        last_emit = 0
+        def callback(samples, frames, timestamp, status):
+            nonlocal last_emit
+            now = time.monotonic()
+            if now - last_emit >= 0.1:
+                self.level.emit(float(np.sqrt(np.mean(samples[:, 0] ** 2))))
+                last_emit = now
+        try:
+            with sd.InputStream(samplerate=22050, channels=1, device=device_id,
+                                blocksize=1024, callback=callback):
+                stop_event.wait()
+        except Exception:
+            self.level.emit(0.0)
 
 
 class Engine(QObject):
@@ -290,6 +333,8 @@ QPushButton:hover {background:#493820;border-color:#d7b36a;}
 QPushButton:disabled {color:#766d5d;border-color:#514737;}
 QLineEdit,QComboBox,QSpinBox,QTextEdit {background:#0f0c09;border:1px solid #4a3925;border-radius:5px;padding:5px;color:#ede4d3;}
 QComboBox QAbstractItemView {background:#20180f;color:#ede4d3;}
+QProgressBar {background:#0f0c09;border:1px solid #4a3925;border-radius:5px;text-align:center;color:#ede4d3;min-height:20px;}
+QProgressBar::chunk {background:#a87932;border-radius:4px;}
 QCheckBox {spacing:8px;}
 QLabel#title {font:24px 'Microsoft YaHei';font-weight:bold;color:#f3d58f;}
 QLabel#hint {color:#aa9a80;}
@@ -355,6 +400,11 @@ class Window(QWidget):
         super().__init__()
         self.settings = load_config()
         self.engine = Engine()
+        self.idle_meter = IdleMeter()
+        self.idle_meter.level.connect(self.show_idle_volume)
+        self.live_events = []
+        self.last_live_key = None
+        self.last_live_seen = 0.0
         self.engine.message.connect(self.log)
         self.engine.meter.connect(self.show_meter)
         self.engine.counts.connect(self.show_counts)
@@ -368,6 +418,10 @@ class Window(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.sync_bridge)
         self.timer.start(5000)
+        self.live_timer = QTimer(self)
+        self.live_timer.timeout.connect(self.poll_live_bridge)
+        self.live_timer.start(250)
+        self.idle_meter.start(self.device.currentData())
 
     def _build(self):
         outer = QVBoxLayout(self)
@@ -385,6 +439,7 @@ class Window(QWidget):
         self.source.currentIndexChanged.connect(self.refresh_devices)
         form.addRow('来源', self.source)
         self.device = QComboBox(); form.addRow('设备', self.device)
+        self.device.currentIndexChanged.connect(self.restart_idle_meter)
         row = QHBoxLayout()
         self.cable_status = QLabel(); row.addWidget(self.cable_status, 1)
         refresh = QPushButton('刷新声道'); refresh.clicked.connect(self.refresh_devices); row.addWidget(refresh)
@@ -395,13 +450,20 @@ class Window(QWidget):
         sample_row.addWidget(self.template_name, 1)
         choose_sample = QPushButton('选择鱼漂声音'); choose_sample.clicked.connect(self.choose_template); sample_row.addWidget(choose_sample)
         form.addRow('识别模板', sample_row)
+        meter_row = QHBoxLayout()
+        self.input_level = QProgressBar(); self.input_level.setRange(0, 100)
+        self.input_level.setValue(0); self.input_level.setFormat('%v / 100')
+        meter_row.addWidget(self.input_level, 1)
+        self.input_level_text = QLabel('等待输入')
+        meter_row.addWidget(self.input_level_text)
+        form.addRow('当前音轨音量', meter_row)
         page.addWidget(box)
 
         controls = QGroupBox('钓鱼控制')
         grid = QGridLayout(controls)
         self.background = QCheckBox('后台运行  ?')
         self.background.setChecked(self.settings['background'])
-        self.background.setToolTip('在选择后台运行前请保证游戏的背景声音选项为开。')
+        self.background.setToolTip('想在切到其他窗口后继续钓鱼？请先在魔兽世界的声音设置里开启“背景声音”。')
         grid.addWidget(self.background, 0, 0)
         self.shield = QCheckBox('定时补盾'); self.shield.setChecked(self.settings['shield_enabled']); grid.addWidget(self.shield, 0, 1)
         self.noise = QCheckBox('喷泉降噪'); self.noise.setChecked(self.settings['noise_enabled']); grid.addWidget(self.noise, 0, 2)
@@ -425,8 +487,9 @@ class Window(QWidget):
         tuning = QGroupBox('声音识别')
         tune = QFormLayout(tuning)
         self.threshold = QSpinBox(); self.threshold.setRange(10, 98); self.threshold.setSuffix(' %'); self.threshold.setValue(round(self.settings['threshold'] * 100))
-        self.rms = QSpinBox(); self.rms.setRange(1, 150); self.rms.setValue(round(self.settings['rms_gate'] * 1000))
-        tune.addRow('相似度阈值', self.threshold); tune.addRow('音量门限 × 1000', self.rms)
+        self.rms = QSpinBox(); self.rms.setRange(1, 100); self.rms.setValue(max(1, min(100, round(self.settings['rms_gate'] * 1000))))
+        self.rms.setToolTip('1–100，数值越高，越不容易被轻微的背景声音触发。通常先保持默认值。')
+        tune.addRow('相似度阈值', self.threshold); tune.addRow('触发音量（1–100）', self.rms)
         noise_button = QPushButton('录制 3 秒环境噪音'); noise_button.clicked.connect(self.capture_noise); tune.addRow(noise_button)
         page.addWidget(tuning)
 
@@ -441,6 +504,12 @@ class Window(QWidget):
             b = QPushButton(label); b.clicked.connect(fn); actions.addWidget(b)
         bf.addRow(actions)
         self.actual = QLabel('尚无游戏记录。'); self.actual.setWordWrap(True); bf.addRow(self.actual)
+        self.link_status = QLabel('实时连接：等待游戏内 /fh start。')
+        self.link_status.setObjectName('hint')
+        bf.addRow(self.link_status)
+        self.achievement_view = QLabel('达拉然钓鱼成就：等待插件数据。')
+        self.achievement_view.setWordWrap(True)
+        bf.addRow(self.achievement_view)
         page.addWidget(bridge)
 
         self.metrics = QLabel('抛竿 0  ·  收竿指令 0  ·  声音 0.0000'); self.metrics.setObjectName('metric'); page.addWidget(self.metrics)
@@ -469,6 +538,22 @@ class Window(QWidget):
         if match is None: match = next((j for j, (i, _) in enumerate(choices) if i == old_id), 0)
         if choices: self.device.setCurrentIndex(match)
         self.cable_status.setText('已检测到 VB-CABLE 输入端。' if cables else '未检测到 VB-CABLE；可下载 Pack45 安装后刷新，或改用实际音轨。')
+        self.restart_idle_meter()
+
+    def restart_idle_meter(self):
+        if hasattr(self, 'device') and hasattr(self, 'input_level') and not self.engine.running():
+            self.idle_meter.start(self.device.currentData())
+
+    def show_idle_volume(self, rms):
+        if not self.engine.running():
+            self._volume = rms
+            self.update_volume_display(rms)
+
+    def update_volume_display(self, rms):
+        level = volume_level(rms)
+        self.input_level.setValue(level)
+        self.input_level_text.setText(f'{level} / 100')
+        self._metric()
 
     def download_cable(self):
         QMessageBox.information(self, '安装 VB-CABLE', '即将从 VB-Audio 官网下载 Pack45。下载后请解压，以管理员身份运行安装程序，重启 Windows 后刷新声道。')
@@ -490,6 +575,7 @@ class Window(QWidget):
         if self.device.currentData() is None:
             QMessageBox.warning(self, '缺少音频输入', '请刷新设备、安装 VB-CABLE，或选择实际输入设备。'); return
         self.settings = self.current_settings(); save_config(self.settings)
+        self.idle_meter.stop()
         self.engine.start(self.settings, self.device.currentData())
         self.start_button.setEnabled(False); self.stop_button.setEnabled(True)
 
@@ -499,20 +585,23 @@ class Window(QWidget):
     def finished(self):
         self.start_button.setEnabled(True); self.stop_button.setEnabled(False)
         self.log('引擎已停止。')
+        self.restart_idle_meter()
 
     def show_meter(self, score, volume):
-        self._score, self._volume = score, volume; self._metric()
+        self._score, self._volume = score, volume
+        self.update_volume_display(volume)
 
     def show_counts(self, casts, hooks):
         self._casts, self._hooks = casts, hooks; self._metric()
 
     def _metric(self):
-        self.metrics.setText(f'抛竿指令 {self._casts}  ·  收竿指令 {self._hooks}  ·  相似度 {self._score:.2f}  ·  音量 {self._volume:.4f}')
+        self.metrics.setText(f'抛竿指令 {self._casts}  ·  收竿指令 {self._hooks}  ·  相似度 {self._score:.2f}  ·  音量 {volume_level(self._volume)} / 100')
 
     def capture_noise(self):
         if self.engine.running():
             QMessageBox.information(self, '正在运行', '请先停止钓鱼，再录制环境声。'); return
         if self.device.currentData() is None: return
+        self.idle_meter.stop()
         try:
             y, _ = librosa.load(str(template_file(self.current_settings())), sr=22050, mono=True)
             size = int(max(0.6, len(y) / 22050) * 22050)
@@ -526,6 +615,8 @@ class Window(QWidget):
             self.log('已录制环境噪音；喷泉降噪已开启。请在没有鱼漂声时录制。')
         except Exception as exc:
             QMessageBox.warning(self, '录制失败', str(exc))
+        finally:
+            self.restart_idle_meter()
 
     def choose_wow(self):
         path = QFileDialog.getExistingDirectory(self, '选择 World of Warcraft 根目录', self.wow_root.text() or str(Path.home()))
@@ -582,18 +673,46 @@ class Window(QWidget):
 
     def sync_bridge(self):
         root = self.wow_root.text().strip()
-        if not root: return
-        stats = summarize(read_events(root))
+        stats = summarize(merge_events(read_events(root) if root else [], self.live_events))
         if not stats['last_sync']:
-            self.actual.setText('尚无已落盘记录。插件需 /fh start；游戏 /reload 或退出后再同步。')
+            self.actual.setText('还没有钓鱼记录。在游戏里使用 /fh start 后，获得的物品会实时显示。')
+            self.achievement_view.setText('达拉然钓鱼成就：等待插件数据。')
             return
         top = stats['items'].most_common(5)
         items = '、'.join(f'{name} ×{count}' for (_, name), count in top) or '无'
         rate = stats['catches'] / stats['cast_ok'] * 100 if stats['cast_ok'] else 0
-        self.actual.setText(f"游戏记录：成功出杆 {stats['cast_ok']} · 失败出杆 {stats['cast_fail']} · 确认渔获 {stats['catches']} · 估计成功率 {rate:.1f}%\n物品：{items}\n上次落盘事件：{time.strftime('%Y-%m-%d %H:%M', time.localtime(stats['last_sync']))}")
+        self.actual.setText(f"游戏记录：成功出杆 {stats['cast_ok']} · 失败出杆 {stats['cast_fail']} · 确认渔获 {stats['catches']} · 估计成功率 {rate:.1f}%\n物品：{items}")
+        achievements = stats['achievements']
+        if achievements:
+            lines = [f"{entry['name']}：{entry['completed']}/{entry['total']}"
+                     for _, entry in sorted(achievements.items())]
+            self.achievement_view.setText('达拉然钓鱼成就\n' + '\n'.join(lines))
+
+    def poll_live_bridge(self):
+        packet = read_visible_packet(wow_window())
+        if packet is None:
+            self.link_status.setText('实时连接：等待游戏左上角的数据条可见；遮挡期间的记录会在 /reload 或退出后补齐。')
+            return
+        self.last_live_seen = time.monotonic()
+        self.link_status.setText('实时连接：已接入游戏插件。')
+        key = (packet['session'], packet['sequence'])
+        if key == self.last_live_key:
+            return
+        self.last_live_key = key
+        self.live_events.append(packet)
+        if len(self.live_events) > 3000:
+            self.live_events = self.live_events[-3000:]
+        if packet['kind'] == 'loot':
+            self.log(f"游戏获得：{packet['name']} ×{packet['quantity']}")
+        elif packet['kind'] == 'achievement' and packet.get('criterion'):
+            self.log(f"成就进度：{packet['name']} {packet['completed']}/{packet['total']}，新完成 {packet['criterion']}")
+        elif packet['kind'] == 'cast_fail':
+            self.log('游戏提示：这次出杆未成功。')
+        self.sync_bridge()
 
     def closeEvent(self, event):
         save_config(self.current_settings())
+        self.idle_meter.stop()
         self.engine.stop()
         super().closeEvent(event)
 

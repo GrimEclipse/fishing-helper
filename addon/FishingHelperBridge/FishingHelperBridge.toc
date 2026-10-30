@@ -1,5 +1,5 @@
 ## Interface: 120007
 ## Title: FishingHelper Bridge
-## Notes: Records fishing casts, loot and combat only after /fh start.
+## Notes: Sends live fishing loot and Dalaran achievement progress after /fh start.
 ## SavedVariables: FishingHelperBridgeDB
 FishingHelperBridge.lua
